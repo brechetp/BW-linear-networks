@@ -1,0 +1,3 @@
+[submodule "EllipticalEmbeddings"]
+	path = EllipticalEmbeddings
+	url = https://github.com/brechetp/EllipticalEmbeddings
