@@ -72,7 +72,6 @@ def train(args):
     else:
         gpu_index = 0
     device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu', gpu_index)
-    grad_rank=  args.grad_rank      # one of "adapt", "full"
 
     lr= args.learning_rate
 
@@ -98,7 +97,6 @@ def train(args):
 # gamma = 1
 
 
-    grad_comp= args.grad_comp
 
     vary_name = None
     fullname = args.name
@@ -111,21 +109,10 @@ def train(args):
 
     # fullname = args.nam
     outroot  = args.output
-    OUTPATH = os.path.join(args.output, fullname)
+    OUTDIR = os.path.join(args.output, fullname)
     # os.makedirs(OUTDIR, exist_ok=True)
 
-    if args.reset or not os.path.isdir(OUTPATH):  # first experiments or reset
-        args.run_id = 1
-    elif args.run_id is None:  # set the id to a new one
-        lsdir = os.listdir(OUTPATH)
-        reg = re.compile("run-(\d+)")
-        prev_runs = [reg.match(r) for r in lsdir]
-        ids = [int(m.group(1)) for m in prev_runs if m is not None]
-        ids.sort(reverse=True)
-        previd = ids[0] if len(ids) > 0 else 0
-        args.run_id = previd + 1
 
-    OUTDIR = os.path.join(OUTPATH, f"run-{args.run_id}")
     os.makedirs(OUTDIR, exist_ok=True)
     PLOTDIR = os.path.join(OUTDIR, "plot")
     os.makedirs(PLOTDIR, exist_ok=True)
@@ -216,29 +203,35 @@ def train(args):
     R0np = R0.detach().cpu().numpy()  # put the square root on the cpu
 
 # Loss of the network
-    def LossBW(Sigma, tau=tau, mask=None, Sigma0=Sigma0, R0=R0, with_grad=False):
-        """use the differentiable sqrtm function"""
-        with torch.set_grad_enabled(with_grad):
+    def LossBW(Sigma, tau=tau, Sigma0=Sigma0, R0=R0):
+        """Bures Wasserstein Loss
+        Sigma: (n,n) model covariance
+        tau (float): regularization strength
+        Sigma0 (n,n): target covariance
+        R0 (n,n): square root for target covariance
 
-            #global Sigma0, R0
-            Sigma0 = Sigma0.to(Sigma.device)
+        Return:
+            loss (float)
+        """
 
-            n = Sigma.size(0)
-            #if mask is None:
-            #    mask = tau == 0
-            if R0 is None:
-                R0 = utils.sqrtm(Sigma0)
-                R0 = (R0 + R0.T)/2
-            else:
-                R0 = R0.to(Sigma.device)
-            # assert sp.linalg.issymmetric(R0), "R0 not symmetric"
-            # assert sp.linalg.issymmetric(Sigma0), "Sigma0 not symmetric"
-            I = torch.eye(n).to(device)
-            M = R0 @ (Sigma + tau*I) @ R0
-            M = (M + M.T)/2
-            # assert sp.linalg.issymmetric(M), "M not symmetric"
-            # return torch.trace(Sigma + tau* I + Sigma0 - 2*(utils.sqrtm(R0 @ (Sigma + tau * I) @ R0, mask=mask)))
-            return max(torch.trace(Sigma + tau*I + Sigma0 - 2* utils.sqrtm(M)), 0)
+        Sigma0 = Sigma0.to(Sigma.device)
+
+        n = Sigma.size(0)
+        #if mask is None:
+        #    mask = tau == 0
+        if R0 is None:
+            R0 = utils.sqrtm(Sigma0)
+            R0 = (R0 + R0.T)/2
+        else:
+            R0 = R0.to(Sigma.device)
+        # assert sp.linalg.issymmetric(R0), "R0 not symmetric"
+        # assert sp.linalg.issymmetric(Sigma0), "Sigma0 not symmetric"
+        I = torch.eye(n).to(device)
+        M = R0 @ (Sigma + tau*I) @ R0
+        M = (M + M.T)/2
+        # assert sp.linalg.issymmetric(M), "M not symmetric"
+        # return torch.trace(Sigma + tau* I + Sigma0 - 2*(utils.sqrtm(R0 @ (Sigma + tau * I) @ R0, mask=mask)))
+        return max(torch.trace(Sigma + tau*I + Sigma0 - 2* utils.sqrtm(M)), 0)
 
     def LossFro(Sigma, tau=tau, mask=None, Sigma0=Sigma0, R0=R0np):
 
@@ -316,7 +309,6 @@ def train(args):
     print("c, cmin, cmax: ", c, cmin.item(), cmax.item())  # it is not > 0 ?
     print("K, C_0, Pred_C, L_OPT:", K.item(), C_0.item(), Pred_C, L_OPT)
 
-    # start_run = args.run_id
 
     # prediction for gradient descent
 
@@ -372,7 +364,7 @@ def train(args):
         """Compute and write the gradients to the parameters"""
 
 
-        grads = model.compute_grads(R0, loss=loss_name, tau=tau, mode=grad_rank)
+        grads = model.compute_grads(R0, loss_name=loss_name, tau=tau)
         for i, p in enumerate(model.parameters()):
             p.grad = grads[i]  # / NS  # first time the gradient is None
 
@@ -390,37 +382,28 @@ def train(args):
         # check the gradient computed in closed form
         # has to check for every parameter? first check for the end-to-end
         # matrix
-        grads = gen.compute_grads(R0, loss=loss_name, tau=tau, mode=grad_rank)
+        grads = gen.compute_grads(R0, loss_name=loss_name, tau=tau)
         max_diff = 0
         for i, p in enumerate(gen.parameters()):
             max_diff = max(max_diff, (p.grad - grads[i]).norm(p='fro').item())
         return max_diff
 
 
-    def compute_gan_loss(model, grad_comp, loss=loss_name):
+    def compute_gan_loss(model, loss_name=loss_name):
         #global R0, Sigma0, n, m
         W = model.end_to_end()
-        # R0 = R0.to(W.device)  # can't change the local variables inside the
-        # Sigma0 = Sigma0.to(W.device)
-        lossA = lossB = None
-        if loss == "BW":
+
+        if loss_name == "BW":  # Bures-Wasserstein loss
             A = R0 @ W @ (R0 @ W).t() + tau * Sigma0  # regularization strength
             sqrtA = utils.sqrtm(A)
-            lossA = W.norm(p='fro').pow( 2) + tau*n + R0.norm(p='fro').pow(2) - 2*torch.trace(sqrtA)
-            # with torch.no_grad():
-            if tau == 0.:  # can compute the loss based on the SVD of R0 @ W
-                r = torch.linalg.matrix_rank(W) if grad_rank == "adapt" else min(n, m)
-                U, S, Vh = torch.linalg.svd(R0.mm(W), full_matrices=False)
-                # sqrtB = U @ torch.diag(S) @ U.t()
+            loss = W.norm(p='fro').pow( 2) + tau*n + R0.norm(p='fro').pow(2) - 2*torch.trace(sqrtA)
 
-                # diff_sqrtm = ( sqrtA - sqrtB).norm(p='fro').item()
-                lossB = W.norm(p='fro').pow( 2) + R0.norm(p='fro').pow(2) - 2*S[:r].sum()
-        elif loss == "Fro":
-            lossA = lossB = (W.mm(W.t()) - Sigma0).norm(p='fro').pow(2)
+        elif loss_name == "Fro":  # Frobenius loss
+            loss = (W.mm(W.t()) - Sigma0).norm(p='fro').pow(2)
         else:
             return NotImplementedError()
 
-        return lossA, lossB
+        return loss
 
 
 # # the actual loop
@@ -428,7 +411,7 @@ def train(args):
 
 
     # all the scalar quantities
-    columns = pd.Index(['time', 'loss A', 'loss B', 'balance', 'norm grad',
+    columns = pd.Index(['time', 'loss', 'balance', 'norm grad',
                         'distance values', 'U - Omega', "WW' - Sigma0", "max diff grad", "rank W", "erank W",
                         #"upper bound", "lower bound",
                         #"cmin", "cmax", #"c diff",
@@ -530,37 +513,21 @@ def train(args):
             stats = dict()  # for the current iteration
             # the keys in stats have to be the same as the headaer of the CSV file
             # the different losses computed with sqrtm (lossA) or SVD (lossB)
-            # grad_comp specifies how the gradient is computed (backprop, etc,...)
-            lossA, lossB = compute_gan_loss(model, grad_comp, loss=loss_name)
-            # backpropagation is performed if grad_comp is backprop, depending on
-            # the loss that was computed (lossB is preferred to lossA)
-            if lossB is not None and grad_comp == "backprop B":
-                lossB.backward()
-                loss = lossB
-                max_diff_grad = check_gradient(model)  # numerical verification of the gradients
-            elif grad_comp == "backprop A":
-                lossA.backward()
-                loss = lossA
-                max_diff_grad = check_gradient(model)  # numerical verification of the gradients
-            else:  # if the grad_comp is manual, we compute the gradients manually
-                loss = lossA
-                max_diff_grad = -1
-                write_gradient(model)  # NS is to divide by the total number of samples
+            loss =  compute_gan_loss(model, loss_name=loss_name)
+
+            write_gradient(model)  # NS is to divide by the total number of samples
 
             # the balance of the layers
             balance = model.compute_balance()
 
             grad = model.get_gradient()  # the gradient used in the update of the model, flattened
             # perform one step after all the samples have been seen
-            stats['rank W'] = model.compute_rank()
-            stats['erank W'] = model.compute_erank()  # the effective rank (exponential entropy of the sv distribution)
-            stats['max diff grad'] =  max_diff_grad
+            # stats['rank W'] = model.compute_rank()
+            # stats['erank W'] = model.compute_erank()  # the effective rank (exponential entropy of the sv distribution)
             optimizer.step()  # update the models parameters
 
             # save_this = (niter % save_every == 0) or (last_iter)
-            stats['loss A'] = lossA.item()
-            if lossB is not None:  # if the loss has been computed using SVD of R0 @ W
-                stats['loss B'] = lossB.item()
+            stats['loss'] = loss.item()
             stats['balance'] = max(balance) if balance else 0 # take the max over all the layers
             stats['norm grad'] = grad.norm().item()
             stats['time'] = niter * lr
@@ -575,13 +542,6 @@ def train(args):
             # n, k = U.size()
             n = W.size(0)
             k = dmin #bottlneck dimension #torch.linalg.matrix_rank(W)  # rank of W
-            # U = U[:, :k]
-            # S = S[:k]
-            # idx = utils.find_closest(S, (Lambda-tau).sqrt())  # the indices of the eigenvalues that are closest to S
-            # UOmega_cos = U.flatten().dot(Omega[:, idx].flatten()) / (U.norm() * Omega[:, idx].norm())
-            # UOmega_norm = (U - Omega[:, idx]).norm()
-            # distance_values = (S[:k] - (Lambda - tau).sqrt()[:k])
-            distance_values = (S[:k].pow(2) - (Lambda - tau)[:k])
             # distance_values = (S[:k] - (Lambda - tau).sqrt()[:k]).norm().item()
             # stats['cos(U, Omega[idx])'][niter] = UOmega_cos
             cos =  (Omega.view(n, -1, 1) * U.view(n, 1, -1)).sum(dim=0).detach().numpy()
@@ -676,11 +636,7 @@ def train(args):
 # plt.show()
 
                 fig = plt.figure()
-                # plt.plot(df['loss A'], label="loss A")
-                if lossB is not None:
-                    plt.plot(df['loss B'], label='loss')
-                else:
-                    plt.plot(df['loss A'], label=['loss'])
+                plt.plot(df['loss'], label=['loss'])
                 plt.legend()
                 ax = plt.gca()
                 ax.ticklabel_format(style="sci", useMathText=True)
@@ -689,18 +645,6 @@ def train(args):
                 fname = os.path.join(PLOTDIR, "loss.pdf")
                 fig.savefig(fname, bbox_inches="tight")
                 # plt.plot(df["upper bound"], label="upper bound")
-                # plt.plot(df["lower bound"], label="lower bound")
-# plt.plot(df['lossB'], label="loss B")
-# plt.show()
-
-                # plt.figure()
-                # plt.plot(df["cmin"], label="cmin")
-                # plt.plot(df["cmax"], label="cmax")
-                # plt.legend()
-
-                # plt.figure()
-                # plt.plot(df['norm grad'], label="norm grad")
-                # plt.legend()
 
                 fig = plt.figure()
                 plt.plot(df["diff loss to OPT"], label="diff loss to OPT")
@@ -716,17 +660,10 @@ def train(args):
                 fname = os.path.join(PLOTDIR, "diff_to_opt.pdf")
                 fig.savefig(fname, bbox_inches="tight")
 
-                # fig = plt.figure()
-                # plt.plot(df["c diff"], label="c diff")
-                # plt.legend()
-                # fig.tight_layout()
-                # plt.title(name)
-                # if save:
-                    # fname = os.path.join(PLOTDIR, "c_diff.pdf")
-                    # fig.savefig(fname, bbox_inches="tight")
                 fig, ax = plt.subplots()
                 fname = os.path.join(PLOTDIR, "dist_eigvals.pdf")
                 df_cvg.plot(ax=ax)
+                ax.set_yscale('log')
                 fig.savefig(fname, bbox_inches="tight")
 
 
@@ -857,8 +794,6 @@ if __name__ == "__main__":
     parser.add_argument("-smm", "--sminmodel", type=float,   default=-1, help="negative value for no effect, >= 0 for setting minimum singular value of the model at initialization (if balanced)")
     # parser.add_argument("-st", "--vmax", type=float,   help="")
 
-    parser.add_argument("-gc", "--grad-comp", choices=("manual", "backprop A", "backprop B"), default="manual" )
-    parser.add_argument("-gr", "--grad-rank", choices=("full", "adapt"), default="full" )
     parser.add_argument("-l", "--loss", choices=("BW", "Fro"), default="BW" )
 
     parser.add_argument("--dataset-fname")
@@ -880,13 +815,13 @@ if __name__ == "__main__":
     grp_debug.add_argument("--no-debug", dest="debug", action="store_false")
 
 
-    gp_force = parser.add_mutually_exclusive_group(required=False)
-    gp_force.add_argument("--reset", action="store_true", help="reset the indexing of the runs")
-    gp_force.add_argument("--continue", dest="reset", action="store_false", help="adapt the indexing of the runs")
+    grp_force = parser.add_mutually_exclusive_group(required=False)
+    grp_force.add_argument("--reset", action="store_true", help="reset the indexing of the runs")
+    grp_force.add_argument("--continue", dest="reset", action="store_false", help="adapt the indexing of the runs")
 
-    gp_dvc = parser.add_mutually_exclusive_group(required=False)
-    gp_dvc.add_argument("--cpu", action="store_true", help="force use cpu")
-    gp_dvc.add_argument("--cuda", dest="cpu", action="store_false", help="use cuda if available")
+    grp_dvc = parser.add_mutually_exclusive_group(required=False)
+    grp_dvc.add_argument("--cpu", action="store_true", help="force use cpu")
+    grp_dvc.add_argument("--cuda", dest="cpu", action="store_false", help="use cuda if available")
 
     grp_gif = parser.add_mutually_exclusive_group(required=False)
     grp_gif.add_argument("--gif", action="store_true", help="makes a gif of the training")
@@ -894,7 +829,6 @@ if __name__ == "__main__":
 
     parser.add_argument('-igpu', "--gpu-index", type=int, help="gpu index to use")
 
-    parser.add_argument("--run-id", type=int, help="if None, will compute the next one based on previous results")
 
     parser.add_argument("--config", type=str, action=ConfigAction, help="a previous config file to run again")
 

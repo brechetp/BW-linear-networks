@@ -98,50 +98,44 @@ class LinearNetwork(nn.Module):
         return utils.compute_erank(W)
 
 
-    def compute_grads(self, R0, loss='BW', grad_L1=None, tau=0.,mode="adapt"):
+    def compute_grads(self, R0, loss_name='BW', grad_L1=None, tau=0.):
         """The manual gradient computation. First compute the gradient on the
         end to end matrix (function space), to then adjust for each of the
         parameters
         R0: root of the target matrix
-        loss: either BW or Fro (default: BW)"""
+        loss_name (BW,Fro): the name of the loss to consider (default: BW)
+        """
+        W = self.end_to_end()
+        n, m = W.size()
+        R0 = R0.to(W.device)
+        if loss_name == 'BW':
+            # R0inv = torch.linalg.inv(R0)
+            if tau == 0.:
+                # if no regularization, the gradient can be computed
+                # with the SVD of the matrix R0 * W
 
-        with torch.no_grad():
-            if grad_L1 is None:  # compute the gradient
-                W = self.end_to_end()
-                n, m = W.size()
-                R0 = R0.to(W.device)
-                if loss == 'BW':
-                    # R0inv = torch.linalg.inv(R0)
-                    if tau == 0.:
-                        # if no regularization, the gradient can be computed
-                        # with the SVD of the matrix R0 * W
-                        # adapt mode means to cut the eigenvalues that should
-                        # be 0 depending on the current rank of the matrix
-                        #
-                        k = torch.linalg.matrix_rank(W) if mode == "adapt" else min(n, m)
+                # the maximum rank possible
+                k = min(n, m)
 
-                        U, S, Vh = torch.linalg.svd(R0.mm(W), full_matrices=False)
-                        # grad_L1 =  2*W - 2 * R0.mm( (torch.linalg.inv(sqrtm(R0.mm(W).mm((R0.mm(W)).t()))))).mm(R0.mm(W))
-                        grad_L1 = 2*(W - R0 @ U[:, :k] @ Vh[:k, :])
-                    elif tau > 0.:
-                        Sigma_tau = R0 @ W @ W.t() @ R0 + tau * R0 @ R0
-                        # L, Q = torch.linalg.eigh(Sigma_tau)
-                        # Root = Q @ (L.pow(-1/2).view(-1, 1) * Q.T)  # multiply each column with L, i.e. the row wise
-                        InvRoot = utils.sqrtm_inv(Sigma_tau)
-                        grad_L1= 2*(W - R0 @ InvRoot @ R0 @ W)
-                elif loss == 'Fro':
-                    Sigma0 = R0.mm(R0)
-                    grad_L1 =  4 * (W.mm(W.t()) - Sigma0).mm(W)
+                U, S, Vh = torch.linalg.svd(R0.mm(W), full_matrices=False)
+                grad_L1 = 2*(W - R0 @ U[:, :k] @ Vh[:k, :])
+            elif tau > 0.:
+                Sigma_tau = R0 @ W @ W.t() @ R0 + tau * R0 @ R0
+                InvRoot = utils.sqrtm_inv(Sigma_tau)
+                grad_L1= 2*(W - R0 @ InvRoot @ R0 @ W)
+        elif loss_name == 'Fro':
+            Sigma0 = R0.mm(R0)
+            grad_L1 =  4 * (W.mm(W.t()) - Sigma0).mm(W)
 
-            front_back = self.compute_front_back_prod()  # list of tupes, index i is  the front and back prod of weight
+        front_back = self.compute_front_back_prod()  # list of tupes, index i is  the front and back prod of weight
 
-            N = self.depth
-            self.grad_L1 = grad_L1.clone()
-            grads = N * [None]
-            for i in range(N):
-                grads[i] = front_back[i][1].t().mm(grad_L1).mm(front_back[i][0].t())
+        N = self.depth
+        self.grad_L1 = grad_L1.clone()
+        grads = N * [None]
+        for i in range(N):
+            grads[i] = front_back[i][1].t().mm(grad_L1).mm(front_back[i][0].t())
 
-            return grads
+        return grads
 
 
     def compute_front_back_prod(self):

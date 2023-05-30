@@ -24,18 +24,6 @@ import tikzplotlib as tpl  # save plots as tikz files
 import pdb
 
 
-class ForkedPdb(pdb.Pdb):
-    """A Pdb subclass that may be used
-    from a forked multiprocessing child
-
-    """
-    def interaction(self, *args, **kwargs):
-        _stdin = sys.stdin
-        try:
-            sys.stdin = open('/dev/stdin')
-            pdb.Pdb.interaction(self, *args, **kwargs)
-        finally:
-            sys.stdin = _stdin
 
 # mpl.use("pgf")
 mpl.rcParams.update(
@@ -553,14 +541,12 @@ def append_df(df_lst, keyval, args, xaxis, yaxis, orderkey):
         return
 
 
-    # ForkedPdb().set_trace()
     if yaxis in ("slope", "lograte") or args.contour in ("slope", "r", "lograte"):
         regressfname = os.path.join(os.path.dirname(f), "regress.pkl")
         try:
             with open(regressfname, "rb") as _f:
                 data = pickle.load(_f)
                 regress = data["regress"]
-                # lograte = data["lograte"]
         except:
             return
 
@@ -573,7 +559,6 @@ def append_df(df_lst, keyval, args, xaxis, yaxis, orderkey):
         df["slope"] = regress.slope
         df["r"] = r2 = regress.rvalue**2
         df["Pred_C"] = dfs["vals"]["Prec_C"]
-    # elif yaxis == "lograte" or args.contour in ("lograte"):  # lograte not
     # working
         # df["lograte"] = lograte
     if yaxis == "smin":

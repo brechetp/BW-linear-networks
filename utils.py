@@ -12,28 +12,16 @@ import itertools
 import scipy as sp
 import math
 from scipy.stats import special_ortho_group
-from EllipticalEmbeddingS.torch_utils import batch_sqrtm  # use the batch matrix sqrt from EES
 
-def sqrtm_inv(M, numIters=10, reg=1.):
-    unsqueeze=False
-    if M.ndim==2:
-        M = M.unsqueeze(0)
-        unsqueeze=True
-    out = batch_sqrtm(M, numIters=numIters, reg=reg)[1]
-    if unsqueeze:
-        out = out.squeeze(0)
-    return out
 
-def sqrtm(M, numIters=10, reg=1.):
-    unsqueeze=False
-    if M.ndim==2:
-        M = M.unsqueeze(0)
-        unsqueeze=True
-    out = batch_sqrtm(M, numIters=numIters, reg=reg)[0]
-    if unsqueeze:
-        out = out.squeeze(0)
-    return out
-
+def sqrtm(A):
+    """Matrix square root
+    KISS: use the function from scipy
+    """
+    if isinstance(A, torch.Tensor):
+        A = A.detach().cpu().numpy()
+    return torch.tensor(sp.linalg.sqrtm(A), dtype=torch.float32)
+       
 
 
 def init_close(W, target=None, Lambda=None, Omega=None, scale=0.95, tau=0, k=None):
