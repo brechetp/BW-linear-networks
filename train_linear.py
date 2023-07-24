@@ -1,31 +1,9 @@
-# ---
-# jupyter:
-#   jupytext:
-#     cell_metadata_filter: -all
-#     formats: ipynb,py:light
-#     text_representation:
-#       extension: .py
-#       format_name: light
-#       format_version: '1.5'
-#       jupytext_version: 1.14.1
-#   kernelspec:
-#     display_name: Python 3 (ipykernel)
-#     language: python
-#     name: python3
-# ---
-
-# +
 import torch
-# import models
-# from torch.utils.data import DataLoader
 import utils
-# import train
 import plot
 import torch.optim as optim
-import torch.optim.lr_scheduler  as lr_scheduler
 import matplotlib.pyplot as plt
 import numpy as np
-import tqdm
 import matplotlib
 import os
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -33,7 +11,6 @@ import json
 import pandas as pd
 import csv
 import math
-import scipy as sp
 import argparse
 import sys
 import datetime
@@ -44,12 +21,42 @@ from collections import defaultdict
 import traceback  # for tracebacks of exceptions
 
 # the default arguments
+DEFAULTS = {
+    "output": "results/",
+    "name": "",
+    "vary-name": "depth/smin",
+    "depth": 10,
+    "width": 20,
+    "zdim": 20,
+    "xdim": 20,
+    "learning-rate": 1e-5,
+    "time": 5,
+    "num-iter": 1000,
+    "init": "close",  # initialize close to the solution
+    "init-scheme": "balance-force",
+    "gamma": 1,
+    "std": 0.1,
+    "smin": -1,  # no restriction on the minium singular value of the target
+    "tau": 0,
+    "grad-comp": "manual", # one of manual, backprop A, backprop B
+    "grad-rank": "full",  # one of full, adapt
+    "save-dataset": True,
+    "dataset-fname": None,
+    "new-dataset": False,
+    "rank-target": None,
+    "load-dataset": True,
+    "loss": "BW",  # the loss to consider, BW or Fro
+    "samp-mode":"eigen",  # the sampling modality for the target , eigen or singular values
+    "samp-distrib": "zipf",  # the distribution used to sample the target
+    "save-every": 0.1,  # save every 10% iterations
+    "cvg-test": True,
+}
 
 
 def train(args):
 
 # args = dict()  # in order to save the arguments
-
+    # args.update(kwargs)  # update the defaults with the input arguments
     redo = False
 
     depth= args.depth     # number of matrices in the network
@@ -72,13 +79,13 @@ def train(args):
     else:
         gpu_index = 0
     device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu', gpu_index)
+    grad_rank=  args.grad_rank      # one of "adapt", "full"
 
     lr= args.learning_rate
 
 
     tau = args.tau #1e-1  # regularization parameters
     smin = args.smin
-    sminmodel = args.sminmodel
 
     init= args.init
 
@@ -109,12 +116,12 @@ def train(args):
 
     # fullname = args.nam
     outroot  = args.output
-    OUTDIR = os.path.join(args.output, fullname)
-    # os.makedirs(OUTDIR, exist_ok=True)
+    OUTPATH = os.path.join(args.output, fullname)
+    # os.makedirs(OUTPATH, exist_ok=True)
 
 
-    os.makedirs(OUTDIR, exist_ok=True)
-    PLOTDIR = os.path.join(OUTDIR, "plot")
+    os.makedirs(OUTPATH, exist_ok=True)
+    PLOTDIR = os.path.join(OUTPATH, "plot")
     os.makedirs(PLOTDIR, exist_ok=True)
 
 # Data generation for the samples
@@ -140,13 +147,13 @@ def train(args):
     plt.close()
 
     # save the configuration
-    with open(os.path.join(OUTDIR, 'config.json'), 'w') as fp:
+    with open(os.path.join(OUTPATH, 'config.json'), 'w') as fp:
         json.dump(vars(args), fp, indent=0, sort_keys=True)
 
-    # logfile = open(os.path.join(OUTDIR, "logs.txt"), 'a') # in roder to write to the log file
-    resf = open(os.path.join(OUTDIR, 'results.csv'), 'a')  # to log the values as csv
-    logf = open(os.path.join(OUTDIR, 'logs.txt'), 'a')
-    errf = open(os.path.join(OUTDIR, 'err.txt'), 'a')
+    # logfile = open(os.path.join(OUTPATH, "logs.txt"), 'a') # in roder to write to the log file
+    resf = open(os.path.join(OUTPATH, 'results.csv'), 'a')  # to log the values as csv
+    logf = open(os.path.join(OUTPATH, 'logs.txt'), 'a')
+    errf = open(os.path.join(OUTPATH, 'err.txt'), 'a')
 
     if not args.debug:
         sys.stdout = logf
@@ -158,27 +165,46 @@ def train(args):
 
         # smin = 15)
 # testset
-    Lambda, Omega = trainset.Lambda, trainset.Omega  # eigenpairs from the trainset
+    Lambda, Omega = trainset.Lambda, trainset.Omega
 
-    r = min(zdim, xdim) # maximum possible rank that we can learn
+# trainloader = DataLoader(
+        # trainset,
+        # batch_size=batch_size,
+        # shuffle=False)  # no SGD
+
+# the eigenvalue decomposition of Sigma0
+    rank_target = xdim
+    r = min(zdim, xdim, rank_target)  # minimum
+    # Lambda, Omega = torch.linalg.eigh(Sigma0)
     Sigma0= trainset.Sigma.to(device)
     R0 = trainset.Root.to(device)
+    # Sigma0 = (Omega @ (Lambda.view(-1, 1) * Omega.t())).to(device)
+    # R0 = (Omega @ (Lambda.view(-1, 1).sqrt() * Omega.t())).to(device)
+    # Lambda and Omega are already in the descending order
+    # Lambda = Lambda.flip([0])  # flip the values (descending order)
+    # Omega = Omega.flip([1])  # flip along the columns to match the eigenvalues
     sminstar = Lambda[r-1].sqrt().item() # minimum eigenvalue of R0
-    tau = min(tau, Lambda[r-1].item())  # clip tau
+    # smin2star = Lambda[dmin-1].sqrt().item()
+    erank_R0 = utils.compute_erank(R0)
+
+    #init_lowrank = False  # if true, will initialize the network to a lower rank (e.g. 1)
+
+# takes the minimum between tau and the smallest eigenvalue
+    tau = min(tau, Lambda[r-1].item())
     print("value of tau:", tau)
 
-    if init == "close":  # arguments for the utils.init_close function
-        init_kwargs = {"target": Sigma0, "Lambda": Lambda, "Omega": Omega, "scale": 0.95, "tau": tau}
+    if init == "close":
+        init_kwargs = {"target": Sigma0, "Lambda": Lambda, "Omega": Omega, "scale": 10.95, "tau": tau}
     else:
         init_kwargs = {"std":  std}  # will be useful only if init == "normal"
 
 # model construction  and initialization
     model = utils.create_network(
+        "const",
         depth,
         din,
         width,
         dout,
-        smin=sminmodel,
         init_name=init,
         init_scheme=ischeme,
         save=True,
@@ -186,9 +212,9 @@ def train(args):
     )
     print("Model: ", model)
     S = torch.linalg.svdvals(model.end_to_end())
-    plt.plot(S.detach().cpu().numpy(), '+', label="singular values")
+    plt.plot(S.detach().cpu().numpy()**2, '+', label="Eigenvalues")
     plt.suptitle(fullname)
-    plt.title("Singular values of W at initialization")
+    plt.title("Eigenvalues of W at initialization")
     plt.legend()
     fname = os.path.join(PLOTDIR, "model-init.pdf")
     plt.savefig(fname=fname)
@@ -197,41 +223,38 @@ def train(args):
     model.to(device)
     dmin = min(model.widths)  # bottleneck
     lambda_dmin = Lambda[dmin-1]  # last eigenvalue that we can possibly learn
+    #full_row_rank = dmin == xdim
 
+    #if init_lowrank:
+     #   model.init_lowrank()
 
     Sigma0np = Sigma0.detach().cpu().numpy()
     R0np = R0.detach().cpu().numpy()  # put the square root on the cpu
 
 # Loss of the network
-    def LossBW(Sigma, tau=tau, Sigma0=Sigma0, R0=R0):
-        """Bures Wasserstein Loss
-        Sigma: (n,n) model covariance
-        tau (float): regularization strength
-        Sigma0 (n,n): target covariance
-        R0 (n,n): square root for target covariance
+    def LossBW(Sigma, tau=tau, mask=None, Sigma0=Sigma0, R0=R0, with_grad=False):
+        """use the differentiable sqrtm function"""
+        with torch.set_grad_enabled(with_grad):
 
-        Return:
-            loss (float)
-        """
+            #global Sigma0, R0
+            Sigma0 = Sigma0.to(Sigma.device)
 
-        Sigma0 = Sigma0.to(Sigma.device)
-
-        n = Sigma.size(0)
-        #if mask is None:
-        #    mask = tau == 0
-        if R0 is None:
-            R0 = utils.sqrtm(Sigma0)
-            R0 = (R0 + R0.T)/2
-        else:
-            R0 = R0.to(Sigma.device)
-        # assert sp.linalg.issymmetric(R0), "R0 not symmetric"
-        # assert sp.linalg.issymmetric(Sigma0), "Sigma0 not symmetric"
-        I = torch.eye(n).to(device)
-        M = R0 @ (Sigma + tau*I) @ R0
-        M = (M + M.T)/2
-        # assert sp.linalg.issymmetric(M), "M not symmetric"
-        # return torch.trace(Sigma + tau* I + Sigma0 - 2*(utils.sqrtm(R0 @ (Sigma + tau * I) @ R0, mask=mask)))
-        return max(torch.trace(Sigma + tau*I + Sigma0 - 2* utils.sqrtm(M)), 0)
+            n = Sigma.size(0)
+            #if mask is None:
+            #    mask = tau == 0
+            if R0 is None:
+                R0 = utils.sqrtm(Sigma0)
+                R0 = (R0 + R0.T)/2
+            else:
+                R0 = R0.to(Sigma.device)
+            # assert sp.linalg.issymmetric(R0), "R0 not symmetric"
+            # assert sp.linalg.issymmetric(Sigma0), "Sigma0 not symmetric"
+            I = torch.eye(n).to(device)
+            M = R0 @ (Sigma + tau*I) @ R0
+            M = (M + M.T)/2
+            # assert sp.linalg.issymmetric(M), "M not symmetric"
+            # return torch.trace(Sigma + tau* I + Sigma0 - 2*(utils.sqrtm(R0 @ (Sigma + tau * I) @ R0, mask=mask)))
+            return max(torch.trace(Sigma + tau*I + Sigma0 - 2* utils.sqrtm(M)), 0)
 
     def LossFro(Sigma, tau=tau, mask=None, Sigma0=Sigma0, R0=R0np):
 
@@ -241,7 +264,17 @@ def train(args):
         #if mask is None:
         #    mask = tau == 0
         return torch.linalg.norm(0.5*(Sigma - Sigma0))**2
-
+        # if R0 is None:
+            # R0 = sp.linalg.sqrtm(Sigma0)
+            # R0 = (R0 + R0.T)/2
+        # # assert sp.linalg.issymmetric(R0), "R0 not symmetric"
+        # # assert sp.linalg.issymmetric(Sigma0), "Sigma0 not symmetric"
+        # I = np.eye(n)
+        # M = R0 @ (Sigma + tau*I) @ R0
+        # M = (M + M.T)/2
+        # # assert sp.linalg.issymmetric(M), "M not symmetric"
+        # # return torch.trace(Sigma + tau* I + Sigma0 - 2*(utils.sqrtm(R0 @ (Sigma + tau * I) @ R0, mask=mask)))
+        # return max(np.trace(Sigma + tau*I + Sigma0 - 2* sp.linalg.sqrtm(M).real), 0)
 # value at initialization
     if args.loss == "BW":
         Loss = LossBW
@@ -264,7 +297,7 @@ def train(args):
             Sigma = (W @ W.T)
             c = smin2star - math.sqrt(Loss(Sigma, tau))
     else:
-        c = max(c, smin2star)  # take a positive c
+        c = max(c, smin2star)  # take a positive c, but not so meaningful
 
     R = utils.sqrtm(Sigma) # square root of Sigma
     X = R0 @ R   # product of the square roots
@@ -280,12 +313,12 @@ def train(args):
 
     vals = defaultdict(float)
     # vals['c'] = c  # minimum singular value the network can learn (with more than one layer)
-    vals['error'] = False  # flag set if an error happened during training
+    vals['error'] = False
     vals['smin'] = smin  # minimum singular value if the network was one layer
     vals['smin*'] = sminstar  # minimum singular value if the network was one layer
     vals['smin**'] = smin2star
 
-    # prediction for gradient descent
+    # prediction for gradient flow
     Loss0 = Loss(Sigma, tau).item()  # value at initialization
     C_0 = 2*(Loss0 + Lambda.sum())  # upper bound for the norm of the weights
     K = math.sqrt(tau * Lambda[-1]) / (2 * C_0 ** 2)  # strongly-convex constant
@@ -302,11 +335,11 @@ def train(args):
     vals['Pred_C'] = Pred_C
     vals['L_OPT'] = L_OPT
     vals['L_OPT_theo'] = L_OPT_theo
+    vals['c'] = c
     print("Diff in L_OPT: ", (L_OPT - L_OPT_theo))
 
-
-
-    print("c, cmin, cmax: ", c, cmin.item(), cmax.item())  # it is not > 0 ?
+    print("erank target (R0):", erank_R0)
+    print("c, cmin, cmax: ", c, cmin.item(), cmax.item())
     print("K, C_0, Pred_C, L_OPT:", K.item(), C_0.item(), Pred_C, L_OPT)
 
 
@@ -332,7 +365,7 @@ def train(args):
     else:
         num_iter = int(args.time / lr + 0.5)
 
-    if args.cvg_test:
+    if args.cvg_test:  # if we stop trainng after convergence test
         save_every = int(args.save_every / lr + 0.5)  # take save_every as
     else:
         save_every = int(args.save_every) if (args.save_every  >= 1 or args.save_every <= 0) else int(num_iter * (args.save_every) +0.5)
@@ -363,10 +396,10 @@ def train(args):
     def write_gradient(model):
         """Compute and write the gradients to the parameters"""
 
-
-        grads = model.compute_grads(R0, loss_name=loss_name, tau=tau)
+        grads = model.compute_grads(R0, loss=loss_name, tau=tau)
         for i, p in enumerate(model.parameters()):
             p.grad = grads[i]  # / NS  # first time the gradient is None
+        return grads
 
 
     x_fixed = trainset.sample(100)  # 100 points for plotting
@@ -375,6 +408,15 @@ def train(args):
     y_fixed_0 = model(z_fixed.to(device))  # original generated data
 
 
+# T = (num_iter - start_iter) // len(trainloader)
+
+# W = model.end_to_end()
+# rank_W = torch.linalg.matrix_rank(W).item()
+# m = len(trainloader.dataset)  # number of points in the training data
+# samples = []
+# while niter <  + start_n:
+# for ep in range(start_ep, num_iter + start_ep):
+# The computation of the loss
 
     # numerical comparison of the gradient as computed with the closed-form
     # solution and the gradient computed with the backpropagation
@@ -382,7 +424,7 @@ def train(args):
         # check the gradient computed in closed form
         # has to check for every parameter? first check for the end-to-end
         # matrix
-        grads = gen.compute_grads(R0, loss_name=loss_name, tau=tau)
+        grads = gen.compute_grads(R0, loss=loss_name, tau=tau, mode=grad_rank)
         max_diff = 0
         for i, p in enumerate(gen.parameters()):
             max_diff = max(max_diff, (p.grad - grads[i]).norm(p='fro').item())
@@ -392,29 +434,30 @@ def train(args):
     def compute_gan_loss(model, loss_name=loss_name):
         #global R0, Sigma0, n, m
         W = model.end_to_end()
-
-        if loss_name == "BW":  # Bures-Wasserstein loss
-            A = R0 @ W @ (R0 @ W).t() + tau * Sigma0  # regularization strength
-            sqrtA = utils.sqrtm(A)
-            loss = W.norm(p='fro').pow( 2) + tau*n + R0.norm(p='fro').pow(2) - 2*torch.trace(sqrtA)
-
-        elif loss_name == "Fro":  # Frobenius loss
-            loss = (W.mm(W.t()) - Sigma0).norm(p='fro').pow(2)
+        # R0 = R0.to(W.device)  # can't change the local variables inside the
+        # Sigma0 = Sigma0.to(W.device)
+        loss_val = None
+        if loss_name == "BW":
+            if tau > 0:
+                A = R0 @ W @ (R0 @ W).t() + tau * Sigma0  # regularization strength
+                sqrtA = utils.sqrtm(A)
+                loss_val = W.norm(p='fro').pow( 2) + tau*n + R0.norm(p='fro').pow(2) - 2*torch.trace(sqrtA)
+            elif tau == 0.:  # can compute the loss based on the SVD of R0 @ W
+                r = min(n, m)
+                U, S, Vh = torch.linalg.svd(R0.mm(W), full_matrices=False)
+                loss_val = W.norm(p='fro').pow( 2) + R0.norm(p='fro').pow(2) - 2*S[:r].sum()
+        elif loss_name == "Fro":
+            loss_val = (W.mm(W.t()) - Sigma0).norm(p='fro').pow(2)
         else:
             return NotImplementedError()
 
-        return loss
+        return loss_val
 
-
-# # the actual loop
-    # df = pd.DataFrame(cols=pd.from_produc)
 
 
     # all the scalar quantities
     columns = pd.Index(['time', 'loss', 'balance', 'norm grad',
                         'distance values', 'U - Omega', "WW' - Sigma0", "max diff grad", "rank W", "erank W",
-                        #"upper bound", "lower bound",
-                        #"cmin", "cmax", #"c diff",
                         "diff loss to OPT", "diff loss to OPT theo", "wass. dist to OPT", "euc. dist to OPT"])
 
     df = pd.DataFrame(columns=columns, index=pd.Index([], name="niter"))
@@ -435,12 +478,6 @@ def train(args):
 
     def get_checkpoint():
         '''Get current checkpoint'''
-        # global stats, df, args, niter
-        # model = {'gen': gen.state_dict(), 'dsc': dsc.state_dict()}
-        # optimizer = optimizer.state_dict()
-        # model = {"gen": gan["gen"].state_dict()}
-        # optimizers = {"gen": optimizer.state_dict()}
-
 
         checkpoint = {
             'model': model.state_dict(),
@@ -458,9 +495,9 @@ def train(args):
         '''Save checkpoint to disk'''
 
 
-        # global prev_n # OUTDIR, ep, prev_n, niter
+        # global prev_n # OUTPATH, ep, prev_n, niter
 
-        CHKPTDIR = os.path.join(OUTDIR, "checkpoints")
+        CHKPTDIR = os.path.join(OUTPATH, "checkpoints")
         os.makedirs(CHKPTDIR, exist_ok=True)
         fname_prev_checkpoint = os.path.join(CHKPTDIR, f"{prev_n}.pth")
         if os.path.isfile(fname_prev_checkpoint):
@@ -471,7 +508,7 @@ def train(args):
         fname = os.path.join(CHKPTDIR, f"{niter}.pth")
 
         # if fname is None:
-            # fname = os.path.join(OUTDIR, name + '.pth')
+            # fname = os.path.join(OUTPATH, name + '.pth')
 
         if checkpoint is None:
             checkpoint = get_checkpoint()
@@ -485,27 +522,15 @@ def train(args):
 
         name=f"dfs.pkl"
 
-        fname = os.path.join(OUTDIR, name)
+        fname = os.path.join(OUTPATH, name)
         dfs = {'quant': df, 'vals': vals, "cos": df_cos, "cvg": df_cvg, 'trainset': trainset}#, "balance": df_balance, "jacob_svd":df_jacob_svd}
 
         with open(fname, "wb") as _f:
             pickle.dump(dfs, _f)
         return
 
-            # "norm(U-Omega)": [], "norm(U-Omega[idx])": [], "WW' - Sigma0": [],
-
-    # for key in stats.keys():  # init the results to 0
-        # stats[key] = np.zeros(num_iter)
-
-    # stats['cos(U, Omega)'] = np.zeros((num_iter, xdim, min(xdim, zdim)))
-    # for pprinting the iterations
-    if args.debug:
-        mtqdm = tqdm.tqdm
-    else:
-        mtqdm = lambda x: x
 
     converged = False
-    delta_iter = int(0.1/lr+0.5)  # wait 0.1 seconds
     try:
         while not converged:
         # for niter in mtqdm(range(num_iter)):
@@ -513,8 +538,10 @@ def train(args):
             stats = dict()  # for the current iteration
             # the keys in stats have to be the same as the headaer of the CSV file
             # the different losses computed with sqrtm (lossA) or SVD (lossB)
-            loss =  compute_gan_loss(model, loss_name=loss_name)
-
+            # grad_comp specifies how the gradient is computed (backprop, etc,...)
+            loss_val = compute_gan_loss(model, loss_name=loss_name)
+            # backpropagation is performed if grad_comp is backprop, depending on
+            # the loss that was computed (lossB is preferred to lossA)
             write_gradient(model)  # NS is to divide by the total number of samples
 
             # the balance of the layers
@@ -522,12 +549,12 @@ def train(args):
 
             grad = model.get_gradient()  # the gradient used in the update of the model, flattened
             # perform one step after all the samples have been seen
-            # stats['rank W'] = model.compute_rank()
-            # stats['erank W'] = model.compute_erank()  # the effective rank (exponential entropy of the sv distribution)
+            stats['rank W'] = model.compute_rank()
+            stats['erank W'] = model.compute_erank()  # the effective rank (exponential entropy of the sv distribution)
             optimizer.step()  # update the models parameters
 
             # save_this = (niter % save_every == 0) or (last_iter)
-            stats['loss'] = loss.item()
+            stats['loss'] = loss_val.item()
             stats['balance'] = max(balance) if balance else 0 # take the max over all the layers
             stats['norm grad'] = grad.norm().item()
             stats['time'] = niter * lr
@@ -542,8 +569,7 @@ def train(args):
             # n, k = U.size()
             n = W.size(0)
             k = dmin #bottlneck dimension #torch.linalg.matrix_rank(W)  # rank of W
-            # distance_values = (S[:k] - (Lambda - tau).sqrt()[:k]).norm().item()
-            # stats['cos(U, Omega[idx])'][niter] = UOmega_cos
+            distance_values = (S[:k].pow(2) - (Lambda - tau)[:k])
             cos =  (Omega.view(n, -1, 1) * U.view(n, 1, -1)).sum(dim=0).detach().numpy()
             df_cos.loc[niter, 'cos(U, Omega)'] = cos  # the cosine 2d data to the dataframe
             # if U.size() == Omega.size():
@@ -565,8 +591,8 @@ def train(args):
             # stats['c diff'] = (smin_W - c).item()
             # stats['cmin'] = (smin - (R - R0@V).norm()).item()
             # stats['cmax'] = (smin - (R + R0@V).norm()).item()
-            stats['diff loss to OPT'] = (loss - L_OPT).abs().item()
-            stats['diff loss to OPT theo'] = (loss - L_OPT_theo).abs().item()
+            stats['diff loss to OPT'] = (loss_val - L_OPT).abs().item()
+            stats['diff loss to OPT theo'] = (loss_val - L_OPT_theo).abs().item()
             stats['euc. dist to OPT'] = (W.mm(W.t()) - OPT).norm().item()
             stats['wass. dist to OPT'] = LossBW(W.to(device).mm(W.T.to(device)), Sigma0=OPT, R0=None, tau=tau).detach().cpu().item()
 
@@ -576,10 +602,9 @@ def train(args):
             csv_writer.writerow(stats)  # to write the csv file
 
             niter += 1
-            # if not args.max_iter:
-            converged = niter > num_iter
-            # else:
-            if args.cvg_test:
+            converged = niter > num_iter  # regular test
+            delta_iter = int(0.1/lr+0.5)  # interation delta to test convergence of the learning
+            if args.cvg_test:  # test the convergence
                 if len(df) >= delta_iter:
                     converged |= df['diff loss to OPT'].iloc[-delta_iter] < 1e-4
             # last_iter = niter >= num_iter
@@ -589,23 +614,12 @@ def train(args):
                 save_dfs()  # write the dataframes to disk
                 prev_n = save_checkpoint(prev_n)
 
-# compute the cosine between U and Omega
-                # cos_UOmega = (Omega.view(n, -1, 1) * U.view(n, 1, -1)).sum(dim=0).detach().numpy()
-
-# compute the prediction curve
 
                 t = df.index.to_numpy()
-#  Plotting
+                prediction_GF  = Loss0 * np.exp(Pred_C * t)
 #
-#
+                # Plotting
 
-
-
-# fname = os.path.join(OUTDIR, "plots/out-{0}.pdf".format(niter))
-# plt.figure()
-# axes to plot samples at first and last iterations
-# compare the start and end generated samples
-                # fname+
                 fig_scatter, axes_scatter = plt.subplots(1, 2, figsize=(10, 5))
                 fname = os.path.join(PLOTDIR, "scatter.pdf")
                 plot.scatter_samples(
@@ -629,13 +643,8 @@ def train(args):
                 plt.tight_layout()
                 fig_scatter.savefig(fname)
 
-# fname = os.path.join(OUTDIR, "plots/out-{0}.pdf".format(niter))
-# plt.figure()
-# axes to plot samples at first and last iterations
-# fig_scatter, axes_scatter = plt.subplots(1, 2, (10, 5))
-# plt.show()
-
                 fig = plt.figure()
+                # plt.plot(df['loss A'], label="loss A")
                 plt.plot(df['loss'], label=['loss'])
                 plt.legend()
                 ax = plt.gca()
@@ -645,12 +654,39 @@ def train(args):
                 fname = os.path.join(PLOTDIR, "loss.pdf")
                 fig.savefig(fname, bbox_inches="tight")
                 # plt.plot(df["upper bound"], label="upper bound")
+                # plt.plot(df["lower bound"], label="lower bound")
+# plt.plot(df['lossB'], label="loss B")
+# plt.show()
+
+                # plt.figure()
+                # plt.plot(df["cmin"], label="cmin")
+                # plt.plot(df["cmax"], label="cmax")
+                # plt.legend()
+
+                # plt.figure()
+                # plt.plot(df['norm grad'], label="norm grad")
+                # plt.legend()
+
+                fig = plt.figure()
+                plt.plot(df['rank W'], label="rank W")
+                plt.plot(df['erank W'], label="erank W")
+                plt.xlabel("niter")
+                ax = plt.gca()
+                ax.ticklabel_format(style="sci", useMathText=True)
+                xmin, xmax = plt.xlim()
+                plt.hlines(erank_R0, xmin, xmax,  colors=['g'], linestyle="dashed", label="erank R0")
+                plt.legend()
+                plt.title(fullname)
+                # if save:
+                fname = os.path.join(PLOTDIR, "ranks.pdf")
+                fig.savefig(fname, bbox_inches="tight")
 
                 fig = plt.figure()
                 plt.plot(df["diff loss to OPT"], label="diff loss to OPT")
                 plt.plot(df["diff loss to OPT theo"], label="diff loss to OPT theo")
                 plt.plot(df["euc. dist to OPT"], label="euc. dist to OPT")
                 plt.plot(df["wass. dist to OPT"], label="wass. dist to OPT")
+                plt.plot(prediction_GF, label="prediction GF")
                 plt.xlabel("niter")
                 plt.legend()
                 plt.yscale('log')
@@ -660,10 +696,17 @@ def train(args):
                 fname = os.path.join(PLOTDIR, "diff_to_opt.pdf")
                 fig.savefig(fname, bbox_inches="tight")
 
+                # fig = plt.figure()
+                # plt.plot(df["c diff"], label="c diff")
+                # plt.legend()
+                # fig.tight_layout()
+                # plt.title(name)
+                # if save:
+                    # fname = os.path.join(PLOTDIR, "c_diff.pdf")
+                    # fig.savefig(fname, bbox_inches="tight")
                 fig, ax = plt.subplots()
                 fname = os.path.join(PLOTDIR, "dist_eigvals.pdf")
                 df_cvg.plot(ax=ax)
-                ax.set_yscale('log')
                 fig.savefig(fname, bbox_inches="tight")
 
 
@@ -693,12 +736,6 @@ def train(args):
                     fname = os.path.join(PLOTDIR, "cos_matrix.pdf")
                     fig.savefig(fname, bbox_inches="tight")
 
-                    if args.gif:
-                        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-                        anim, hmap, line = plot.plot_gif(df_cos['cos(U, Omega)'].values, df['distance values'], fig, axes)
-                        fname = os.path.join(PLOTDIR, "cos_matrix.gif")
-                        anim.save(fname, writer="imagemagick")
-
                 plt.close('all')
 # axes[1].plot(stats['distance values'], label="distance values")
 # axes[1].plot(stats["norm(U-Omega)"], label="norm(U-Omega)")
@@ -718,6 +755,23 @@ def train(args):
         traceback.print_exc()
 
 
+        # log some informations
+        # with torch.no_grad():
+        # W = model.end_to_end()
+        # R = utils.sqrtm(W.mm(W.t()))
+        # n, m = W.size()
+        # norm_W = W.norm(p='fro').item()
+        # # dvc = R0.device
+        # # R0 = R0.to(W.device)
+        # r = rank_W = torch.linalg.matrix_rank(R0 @ W).item()
+
+        # k = rank_W
+        # Uk, Sk, Vhk = torch.linalg.svd(Sigma0, full_matrices=False)
+        # SigApp = Uk[:, :k] @ torch.diag(Sk[:k]) @ Vhk[:k, :]
+
+        # # det_WWt = torch.linalg.det(W.mm(W.t())).item()
+
+        # Sigma = W @ W.t() + tau * torch.eye(n)
 
 
 # end of training
@@ -767,72 +821,66 @@ if __name__ == "__main__":
 
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-o", "--output", default="./results/")
-    parser.add_argument("-n", "--name", default="")
-    parser.add_argument("-vn", "--vary-name", nargs='*', default=None)
-    parser.add_argument("-lr", "--learning-rate",  type=float, default=1e-3, help="the learning rate for optimization")
-    parser.add_argument("-d", "--depth",  type=int, default = 5, help="")
-    parser.add_argument("-w", "--width",  type=int, default = 20, help="")
-    parser.add_argument("-x", "--xdim",  type=int, default = 20, help="")
-    parser.add_argument("-z", "--zdim",  type=int, default = 20, help="")
+    parser.add_argument("-o", "--output", default=DEFAULTS["output"])
+    parser.add_argument("-n", "--name", default=DEFAULTS["name"])
+    parser.add_argument("-vn", "--vary-name", default=DEFAULTS["vary-name"])
+    parser.add_argument("-lr", "--learning-rate",  type=float, default=DEFAULTS["learning-rate"], help="the learning rate for optimization")
+    parser.add_argument("-d", "--depth",  type=int, default = DEFAULTS["depth"],  help="")
+    parser.add_argument("-w", "--width",  type=int, default = DEFAULTS["width"], help="")
+    parser.add_argument("-x", "--xdim",  type=int, default = DEFAULTS["xdim"], help="")
+    parser.add_argument("-z", "--zdim",  type=int, default = DEFAULTS["zdim"], help="")
     grp_iter = parser.add_mutually_exclusive_group(required=False)
     grp_iter.add_argument("-N", "--num-iter",  type=int, help="force number of iterations")
     # grp_iter.add_argument("-M", "--max-iter", type=int,  help="maximum number of iterations, use the convergence test to stop training")
     # grp_iter.add_argument("-M", "--max-time", type=int,  help="maximum number of iterations, use the convergence test to stop training")
-    grp_iter.add_argument("-T", "--time",  type=float,  default=10., help="absolute time of training")
+    grp_iter.add_argument("-T", "--time",  type=float,  default=DEFAULTS["time"], help="absolute time of training")
 
     grp_iter_mode = parser.add_mutually_exclusive_group(required=False)
     grp_iter_mode.add_argument("--cvg-test", action="store_true", help="use a convergence test to stop the training")
     grp_iter_mode.add_argument("--no-cvg-test", dest="cvg_test", action="store_false", help="only use the number of iterations to stop the training")
 
-    parser.add_argument("-i", "--init",   choices=utils.INITIALIZATIONS.keys(), default="normal", help="the initalization function")
-    parser.add_argument("-is", "--init-scheme",  default="balance-force", choices=("balance", "ortho", "balance-force", None), help="the initialization scheme")
-    parser.add_argument("-gma", "--gamma",   type=float, default=1., help="Gamma value for initialization of the weights")
+    parser.add_argument("-i", "--init",   choices=utils.INITIALIZATIONS.keys(), default=DEFAULTS["init"], help="the initalization function")
+    parser.add_argument("-is", "--init-scheme",  default=DEFAULTS["init-scheme"], choices=("balance", "ortho", "balance-force", None), help="the initialization scheme")
+    parser.add_argument("-gma", "--gamma",   type=float, default=DEFAULTS["gamma"], help="Gamma value for initialization of the weights")
     parser.add_argument("--std",   type=float, help="standard deviation for the weights")
-    parser.add_argument("-t", "--tau",  type=float, default=0.0,  help="")
-    parser.add_argument("-s", "--smin", type=float,   default=-1, help="negative value for no effect, >= 0 for setting minimum singular value of the target")
-    parser.add_argument("-smm", "--sminmodel", type=float,   default=-1, help="negative value for no effect, >= 0 for setting minimum singular value of the model at initialization (if balanced)")
+    parser.add_argument("-t", "--tau",  type=float, default=DEFAULTS["tau"],  help="")
+    parser.add_argument("-s", "--smin", type=float,   default=DEFAULTS["smin"], help="negative value for no effect, >= 0 for setting minimum singular value of the target")
     # parser.add_argument("-st", "--vmax", type=float,   help="")
 
-    parser.add_argument("-l", "--loss", choices=("BW", "Fro"), default="BW" )
+    parser.add_argument("--rank-target",    type=int, help="")
+    parser.add_argument("-gc", "--grad-comp", choices=("manual", "backprop A", "backprop B"), default=DEFAULTS["grad-comp"])
+    parser.add_argument("-gr", "--grad-rank", choices=("full", "adapt"), default=DEFAULTS["grad-rank"])
+    parser.add_argument("-l", "--loss", choices=("BW", "Fro"), default=DEFAULTS["loss"])
 
     parser.add_argument("--dataset-fname")
     grp_newds = parser.add_mutually_exclusive_group(required=False)
     grp_newds.add_argument("--new-dataset", action="store_true")
-    grp_newds.add_argument("--load-dataset", nargs="?", type=str, default="", const="")
+    grp_newds.add_argument("--load-dataset", nargs="?", type=str, default=DEFAULTS["load-dataset"], const="")
 
-    parser.add_argument("-sm", "--samp-mode", choices=("eig", "sing"), default="eig", help="sample either singular values or eigenvalues of the target")
-    parser.add_argument("-sd", "--samp-distrib", choices=("random", "zipf"), default="zipf", help="the way the sampling for the target is performed")
+    parser.add_argument("-sm", "--samp-mode", choices=("eig", "sing"), default=DEFAULTS["samp-mode"], help="sample either singular values or eigenvalues of the target")
+    parser.add_argument("-sd", "--samp-distrib", choices=("random", "zipf"), default=DEFAULTS["samp-distrib"], help="the way the sampling for the target is performed")
 
     grp_saveds = parser.add_mutually_exclusive_group(required=False)
     grp_saveds.add_argument("--save-dataset", action="store_true")
     grp_saveds.add_argument("--no-save-dataset", dest="save_dataset", action="store_false")
 
-    parser.add_argument("--save-every", type=float, default=0.1, help="the number of iterations to save after, or frequency when between 0 and 1")
+    parser.add_argument("--save-every", type=float, default=DEFAULTS["save-every"], help="the number of iterations to save after, or frequency when between 0 and 1")
 
     grp_debug = parser.add_mutually_exclusive_group(required=False)
     grp_debug.add_argument("--debug", action="store_true")
     grp_debug.add_argument("--no-debug", dest="debug", action="store_false")
 
 
-    grp_force = parser.add_mutually_exclusive_group(required=False)
-    grp_force.add_argument("--reset", action="store_true", help="reset the indexing of the runs")
-    grp_force.add_argument("--continue", dest="reset", action="store_false", help="adapt the indexing of the runs")
 
-    grp_dvc = parser.add_mutually_exclusive_group(required=False)
-    grp_dvc.add_argument("--cpu", action="store_true", help="force use cpu")
-    grp_dvc.add_argument("--cuda", dest="cpu", action="store_false", help="use cuda if available")
-
-    grp_gif = parser.add_mutually_exclusive_group(required=False)
-    grp_gif.add_argument("--gif", action="store_true", help="makes a gif of the training")
-    grp_gif.add_argument("--no-gif", dest="gif", action="store_false", help="no gif")
+    gp_dvc = parser.add_mutually_exclusive_group(required=False)
+    gp_dvc.add_argument("--cpu", action="store_true", help="force use cpu")
+    gp_dvc.add_argument("--cuda", dest="cpu", action="store_false", help="use cuda if available")
 
     parser.add_argument('-igpu', "--gpu-index", type=int, help="gpu index to use")
 
-
     parser.add_argument("--config", type=str, action=ConfigAction, help="a previous config file to run again")
 
-    parser.set_defaults(save_dataset=True, new_dataset=False, debug=False, reset=True, cpu=False, gif=False, cvg_test=True)
+    parser.set_defaults(save_dataset=True, new_dataset=False, debug=False, cpu=False, cvg_test=DEFAULTS["cvg-test"])
 
     args = parser.parse_args()
 

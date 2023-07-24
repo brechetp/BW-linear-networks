@@ -7,13 +7,13 @@ import utils
 class LinearNetwork(nn.Module):
     """A linear network"""
 
-    def __init__(self, widths):
+    def __init__(self, widths, bias=False):
         """Gets the widths as a list"""
 
         # init the parent class nn.Module
         super().__init__()
         # the layers as a list of nn.Linear objects
-        layers = [nn.Linear(widths[i], widths[i+1], False)
+        layers = [nn.Linear(widths[i], widths[i+1], bias)
                   for i in range(len(widths)-1)]
         # combine all the layers together
         self.layers = nn.Sequential(*layers)
@@ -24,6 +24,10 @@ class LinearNetwork(nn.Module):
         self.depth = len(widths)-1
         return
 
+    @property
+    def device(self):
+        return self.layers[0].weight.device
+
     def forward(self, x):
 
         return self.layers(x)
@@ -33,7 +37,7 @@ class LinearNetwork(nn.Module):
         # allows the input / output to be greater than min over the layers
         # W = torch.randn(self.nout, self.nin)
         if init_fn is not None:
-            W = init_fn(torch.empty(self.dout, self.din), *args, **kwargs)
+            W = init_fn(torch.empty(self.dout, self.din, device=self.device), *args, **kwargs)
         else:
             W = self.end_to_end()
 
@@ -41,33 +45,63 @@ class LinearNetwork(nn.Module):
         N = self.depth
         b = min(self.widths)  # bottlneck
         U, S, Vt = torch.linalg.svd(W, full_matrices=True)
-        if smin >= 0:
+        if smin >= 0:  # lower the minimum singular value of the initialization
             S += smin - S[-1]
         Sn = S ** (1/N)
         # p = len(S)  # the number of singular values
         for idx, layer in enumerate(self.layers):
             (m, n) = layer.weight.size()
             k = min(n, m, b)
-            layer.weight = nn.Parameter(
-                torch.cat(
-                    [torch.cat(
-                         [torch.diag(Sn[: k]),
-                          torch.zeros(k, n - k)],
-                         dim=1),
-                     torch.zeros(m - k, n)],
-                    dim=0),
-                requires_grad=True)
+            layer.weight.data  = torch.cat( [torch.cat(
+                [torch.diag(Sn[: k]), torch.zeros(k, n - k, device=Sn.device)], dim=1),
+                                      torch.zeros(m - k, n, device=Sn.device)], dim=0)
             if idx == 0:  # first layer
-                layer.weight = nn.Parameter(
-                    layer.weight.mm(Vt), requires_grad=True)
+                layer.weight.data = layer.weight.data.mm(Vt)
             if idx == (N-1):  # last layer
-                layer.weight = nn.Parameter(
-                    U.mm(layer.weight),
-                    requires_grad=True)
+                layer.weight.data = U.mm(layer.weight.data)
             # self.register_parameter(f"{idx}", layer.weight)
         return
 
+    def init_ortho(self):
 
+        # N = self.depth
+        # S_min, S_max = 0.1 ** (1/N), 10 ** (1/N)
+        # p = min(self.din, self.dout)
+        # p = len(S)  # the number of singular values
+        for idx, layer in enumerate(self.layers):
+            (m, n) = layer.weight.size()
+            k = min(n, m)
+
+            # Sk = torch.zeros(k).uniform_(S_min, S_max)  # sample the singular
+            # values
+            U = torch.tensor(ortho_group.rvs(dim=m), dtype=torch.float32)
+            Vt = torch.tensor(ortho_group.rvs(dim=n), dtype=torch.float32)
+            # D = torch.cat([torch.cat([torch.diag(Sk), torch.zeros(k, n-k)],
+            # dim=1), torch.zeros(m-k, n)], dim=0) # diagonal with singlar
+            # values
+            layer.weight = nn.Parameter(
+                U[:, :k].mm(Vt[:k, :]), requires_grad=True
+            )
+            # if idx == 0:  # first layer
+            # layer.weight = nn.Parameter(layer.weight.mm(Vt), requires_grad=True)
+            # if idx == (N-1):  # last layer
+            # layer.weight = nn.Parameter(U.mm(layer.weight), requires_grad=True)
+            # self.register_parameter(f"{idx}", layer.weight)
+        return
+
+    def init_lowrank(self, rank=1):
+
+        rank = min(rank, min(self.widths))  # rank has to be upper bounded by the bottleneck
+        for idx, layer in enumerate(list(self.layers[:1]) + list(self.layers[-1:])): # input and output layers
+            # (m, n) = layer.weight.size()
+            # k = min(n, m)
+            U, S, Vh = torch.linalg.svd(layer.weight.data)
+            # values
+            layer.weight = nn.Parameter(
+                U[:, :rank].mm( S.view(-1, 1)[:rank] * Vh[:rank, :]), requires_grad=True
+            )
+            # self.register_parameter(f"{idx}", layer.weight)
+        return
 
     def compute_balance(self):
         """Compute the balance value for each of the layers"""
@@ -98,44 +132,43 @@ class LinearNetwork(nn.Module):
         return utils.compute_erank(W)
 
 
-    def compute_grads(self, R0, loss_name='BW', grad_L1=None, tau=0.):
+    def compute_grads(self, R0, loss='BW', grad_L1=None, tau=0.):
         """The manual gradient computation. First compute the gradient on the
         end to end matrix (function space), to then adjust for each of the
         parameters
         R0: root of the target matrix
-        loss_name (BW,Fro): the name of the loss to consider (default: BW)
-        """
-        W = self.end_to_end()
-        n, m = W.size()
-        R0 = R0.to(W.device)
-        if loss_name == 'BW':
-            # R0inv = torch.linalg.inv(R0)
-            if tau == 0.:
-                # if no regularization, the gradient can be computed
-                # with the SVD of the matrix R0 * W
+        loss: either BW or Fro (default: BW)"""
 
-                # the maximum rank possible
-                k = min(n, m)
+        with torch.no_grad():
+            if grad_L1 is None:  # compute the gradient
+                W = self.end_to_end()
+                n, m = W.size()
+                R0 = R0.to(W.device)
+                if loss == 'BW':
+                    # R0inv = torch.linalg.inv(R0)
+                    if tau == 0.:
+                        #
+                        k = min(n, m)
+                        U, S, Vh = torch.linalg.svd(R0.mm(W), full_matrices=False)
+                        # grad_L1 =  2*W - 2 * R0.mm( (torch.linalg.inv(sqrtm(R0.mm(W).mm((R0.mm(W)).t()))))).mm(R0.mm(W))
+                        grad_L1 = 2*(W - R0 @ U[:, :k] @ Vh[:k, :])
+                    elif tau > 0.:
+                        Sigma_tau = R0 @ W @ W.t() @ R0 + tau * R0 @ R0
+                        InvRoot = utils.sqrtm_inv(Sigma_tau)
+                        grad_L1= 2*(W - R0 @ InvRoot @ R0 @ W)
+                elif loss == 'Fro':
+                    Sigma0 = R0.mm(R0)
+                    grad_L1 =  4 * (W.mm(W.t()) - Sigma0).mm(W)
 
-                U, S, Vh = torch.linalg.svd(R0.mm(W), full_matrices=False)
-                grad_L1 = 2*(W - R0 @ U[:, :k] @ Vh[:k, :])
-            elif tau > 0.:
-                Sigma_tau = R0 @ W @ W.t() @ R0 + tau * R0 @ R0
-                InvRoot = utils.sqrtm_inv(Sigma_tau)
-                grad_L1= 2*(W - R0 @ InvRoot @ R0 @ W)
-        elif loss_name == 'Fro':
-            Sigma0 = R0.mm(R0)
-            grad_L1 =  4 * (W.mm(W.t()) - Sigma0).mm(W)
+            front_back = self.compute_front_back_prod()  # list of tupes, index i is  the front and back prod of weight
 
-        front_back = self.compute_front_back_prod()  # list of tupes, index i is  the front and back prod of weight
+            N = self.depth
+            self.grad_L1 = grad_L1.clone()
+            grads = N * [None]
+            for i in range(N):
+                grads[i] = front_back[i][1].t().mm(grad_L1).mm(front_back[i][0].t())
 
-        N = self.depth
-        self.grad_L1 = grad_L1.clone()
-        grads = N * [None]
-        for i in range(N):
-            grads[i] = front_back[i][1].t().mm(grad_L1).mm(front_back[i][0].t())
-
-        return grads
+            return grads
 
 
     def compute_front_back_prod(self):

@@ -20,10 +20,21 @@ from functools import partial  # partial evaluation of a function
 from matplotlib.cm import ScalarMappable
 # plt.rcParams['text.usetex'] = True
 import matplotlib as mpl
-import tikzplotlib as tpl  # save plots as tikz files
 import pdb
 
 
+class ForkedPdb(pdb.Pdb):
+    """A Pdb subclass that may be used
+    from a forked multiprocessing child
+
+    """
+    def interaction(self, *args, **kwargs):
+        _stdin = sys.stdin
+        try:
+            sys.stdin = open('/dev/stdin')
+            pdb.Pdb.interaction(self, *args, **kwargs)
+        finally:
+            sys.stdin = _stdin
 
 # mpl.use("pgf")
 mpl.rcParams.update(
@@ -185,88 +196,9 @@ def compute(args):
         s = int(0.01 / lr + 0.5)  # sample in one per centisecond
         logwassewm = logwass.ewm(span=s).mean()[wass.index[::s]]  # subsample the signal after smoothing it
         dlogwass = (logwassewm.shift(-1) - logwassewm.shift(1)) /2
-        # d2logwass = (logwassewm.shift(-1) - 2*logwassewm + logwassewm.shift(1))
-        # d2logwass0 = d2logwass.copy() # will filter out the small values
-        # th = d2logwass.abs().max() / 100  # arbitrary
-        # d2logwass0[d2logwass.abs() < th] = 0
-        # sgnd2 = np.sign(d2logwass0)  # sign of the second derivative
 
-        # pos = sgnd2 > 0
-        # null = sgnd2 == 0
-        # neg = sgnd2 < 0
-
-        # begidx = np.where(null & neg.shift(-1))  # points with pos to neg, "begin" of the slope
-        # endidx = np.where(pos & null.shift(-1))
-        # mididx = np.where(neg & pos.shift(-1))
-
-        # begpts = sgnd2.index[begidx]
-        # endpts = sgnd2.index[endidx]
-        # midpts  = sgnd2.index[mididx]
-
-
-        # d3logwass = (d2logwass.shift(-1) - d2logwass.shift(1)) / 2  # have to look for the zeros of this 3rd order derivative
-        # d3logwass0 = d3logwass.copy()
-        # th = d3logwass.abs().max() / 1000
-        # d3logwass0[d3logwass.abs() < th] = 0
-        # sgnd3 = np.sign(d3logwass0)
-
-        # pos3 = sgnd3 >0
-        # neg3 = sgnd3 <0
-
-        # begidx3 = np.where(neg3 & pos3.shift(-1))
-        # endidx3 = np.where(pos3 & neg3.shift(-1))
-
-        # beg3 = sgnd3.index[begidx3]
-        # end3 = sgnd3.index[endidx3]
-
-        # d4logwass = (d2logwass.shift(-1) - 2*d2logwass + d2logwass.shift(1))  # have to look for the zeros of this 3rd order derivative
-        # d4logwass0 = d4logwass.copy()
-        # th = d4logwass.abs().max() / 1000
-        # d4logwass0[d4logwass.abs() < th] = 0
-        # sgnd4 = np.sign(d4logwass0)
-
-        # pos4 = sgnd4 >0
-        # neg4 = sgnd4 <0
-
-        # begidx4 = np.where(neg4 & pos4.shift(-1))
-        # endidx4 = np.where(pos4 & neg4.shift(-1))
-
-        # beg4 = sgnd4.index[begidx4]
-        # end4 = sgnd4.index[endidx4]
-
-
-        # plt.figure()
-        # logwass.plot()
-
-        # logwass[begpts].plot(style='+')
-        # logwass[endpts].plot(style='x')
-        # logwass[midpts].plot(style='o')
-
-        # logwass[beg3].plot(style='>')
-        # logwass[end3].plot(style='<')
-
-        # logwass[beg4].plot(style='1')
-        # logwass[end4].plot(style='2')
-
-        # pid = "debug"
-        # outstat = os.path.join(outdir, "logwass")
-        # os.makedirs(outstat, exist_ok=True)
-        # plt.savefig(os.path.join(outstat, f"{outname}.pdf"))
-
-
-        # # firstiter = diff.diff().diff()
-        # plt.figure()
-        # df["slope"] = dlogwass
-        # # dlogwass.abs().plot()
         dabs = dlogwass.abs()
 
-        # plt.figure()
-        # dlogwass.abs().plot()
-        # dlogwass.abs()[beg3].plot(style='>')
-        # dlogwass.abs()[end3].plot(style='<')
-        # dlogwass.abs()[beg4].plot(style='1')
-        # dlogwass.abs()[end4].plot(style='2')
-        # # d2logwass.plot()
         d2abs = (dabs.shift(-1) - dabs.shift(1)) / 2
         d2abs0 = d2abs.copy()
         d2abs0[d2abs.abs() < d2abs.abs().max()/10] = 0
@@ -281,12 +213,6 @@ def compute(args):
         begpts = d2abs.index[begidx]
         endpts = d2abs.index[endidx]
 
-        # d2abs.plot()
-        # d2abs[begpts].plot(style='>')
-        # d2abs[endpts].plot(style='<')
-        # outstat = os.path.join(outdir, "slope")
-        # os.makedirs(outstat, exist_ok=True)
-        # plt.savefig(os.path.join(outstat, f"{outname}.pdf"))
         th = dabs.max() * 2/3
         mask = dabs > th
         components = np.where(mask)[0]
@@ -332,19 +258,10 @@ def compute(args):
             continue
 
 
-        # plt.figure()
-        # logwass.plot()
-        # logwass[[interval[0]]].plot(style='>')
-        # logwass[[interval[1]]].plot(style='<')
-        # outstat = os.path.join(outdir, "interval")
-        # os.makedirs(outstat, exist_ok=True)
-        # plt.savefig(os.path.join(outstat, f"{outname}.pdf"))
-
-        # compute the linear regression at the interval
 
         x = logdiff.index[interval[0]:interval[1]]
         y = logdiff[interval[0]:interval[1]]
-        mask = np.isfinite(y)
+        mask = np.isfinite(y)  # only consider finite data
         regress = sp.stats.linregress(x[mask]*lr, y[mask]) # slope in s^-1
 
         plt.figure()
@@ -541,12 +458,14 @@ def append_df(df_lst, keyval, args, xaxis, yaxis, orderkey):
         return
 
 
+    # ForkedPdb().set_trace()
     if yaxis in ("slope", "lograte") or args.contour in ("slope", "r", "lograte"):
         regressfname = os.path.join(os.path.dirname(f), "regress.pkl")
         try:
             with open(regressfname, "rb") as _f:
                 data = pickle.load(_f)
                 regress = data["regress"]
+                # lograte = data["lograte"]
         except:
             return
 
@@ -559,6 +478,7 @@ def append_df(df_lst, keyval, args, xaxis, yaxis, orderkey):
         df["slope"] = regress.slope
         df["r"] = r2 = regress.rvalue**2
         df["Pred_C"] = dfs["vals"]["Prec_C"]
+    # elif yaxis == "lograte" or args.contour in ("lograte"):  # lograte not
     # working
         # df["lograte"] = lograte
     if yaxis == "smin":
@@ -665,7 +585,7 @@ def plot(args):  # assume the compare key is not None
 
         key = tuple([data[k] for k in orderkey if k in data.keys() and (not k in conf.keys() or len(conf[k]) > 1)])
         if key in keys:
-            print("Key {key} already in keys!")
+            print(f"Key {key} already in keys!")
         keys.append(key)
         fnames[key] = f
         shared_conf = {k:v for k,v in shared_conf.items() if k in data.keys() and v == data[k]} if shared_conf is not None else data
@@ -804,7 +724,6 @@ def plot(args):  # assume the compare key is not None
                 # ctr.axes.figure.suptitle(f"{stat} for {keyname} = {keyval}")
                 plt.savefig(os.path.join(plotfolder,  plotname), bbox_inches="tight")
                 plt.savefig(os.path.join(plotfolder,  plotnamepgf))
-                # tpl.save(os.path.join(plotfolder,  plotnametex))
                 plt.close("all")
 
 
@@ -954,7 +873,6 @@ def plot(args):  # assume the compare key is not None
                 # plt.title(stat + niterstr)
                 plt.savefig(os.path.join(plotfolder,  f"{string}.pgf"), bbox_inches="tight")
                 plt.savefig(os.path.join(plotfolder,  f"{string}.pdf"))
-                # tpl.save(os.path.join(plotfolder,  f"{string}.tex"))
                 plt.close("all")
         # end of process keys
         # df_filt = df_merge.loc[:, df_merge.columns.get_level_values("stat") == stat]
